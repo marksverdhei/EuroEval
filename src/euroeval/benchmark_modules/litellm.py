@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import typing as t
-from functools import cached_property, partial
+from functools import cache, cached_property, partial
 from time import sleep
 
 import litellm
@@ -37,7 +37,6 @@ from pydantic import conlist, create_model
 from requests.exceptions import RequestException
 from tqdm.asyncio import tqdm as tqdm_async
 
-from ..caching_utils import cache_arguments
 from ..constants import (
     JSON_STRIP_CHARACTERS,
     LITELLM_CLASSIFICATION_OUTPUT_KEY,
@@ -131,7 +130,6 @@ MODEL_MAX_LENGTH_MAPPING = {
     r"gpt-4.1.*": 1_047_576,
     # Anthropic models
     r"(anthropic/)?claude-[1-9](-[1-9])?-(opus|sonnet|haiku)-[0-9]{8}": 200_000,
-    r"(anthropic/)?claude-(opus|sonnet|haiku)-[1-9](-[1-9])?-[0-9]{8}": 200_000,
     # Gemini models
     r"(gemini/)?gemini-1\.5-flash.*": 1_048_576,
     r"(gemini/)?gemini-1\.5-pro.*": 2_097_152,
@@ -310,7 +308,7 @@ class LiteLLMModel(BenchmarkModule):
             InvalidBenchmark:
                 If the inputs do not contain either 'messages' or 'text' keys.
         """
-        model_inputs: c.Sequence[c.Sequence[litellm.AllMessageValues] | str]
+        model_inputs: list[list[litellm.AllMessageValues] | str]
         if "messages" in inputs:
             model_inputs = inputs["messages"]
         elif "text" in inputs:
@@ -331,9 +329,9 @@ class LiteLLMModel(BenchmarkModule):
         )
 
         all_responses: dict[int, "ModelResponse"] = {}
-        inputs_to_run: c.Sequence[
-            tuple[int, c.Sequence[litellm.AllMessageValues] | str]
-        ] = list(enumerate(model_inputs))
+        inputs_to_run: list[tuple[int, list[litellm.AllMessageValues] | str]] = list(
+            enumerate(model_inputs)
+        )
         for attempt in range(num_attempts := 10):
             if not inputs_to_run:
                 break
@@ -422,19 +420,14 @@ class LiteLLMModel(BenchmarkModule):
             "'stop' is not supported with this model",
             "'$.stop' is invalid",
         ]
-        stop_pattern = re.compile(r"does not support parameters: \[.*'stop'.*\]")
         logprobs_messages = [
             "you are not allowed to request logprobs",
             "you've reached the maximum number of requests with logprobs",
             "logprobs is not supported",
             "logprobs is not enabled",
-            "Invalid value at 'generation_config.response_logprobs' (TYPE_BOOL)",
         ]
-        logprobs_pattern = re.compile(
-            r"does not support parameters: \[.*'logprobs'.*\]"
-        )
         top_logprobs_messages = ["got an unexpected keyword argument 'top_logprobs'"]
-        top_logprobs_pattern = re.compile(
+        logprobs_pattern = re.compile(
             r"does not support parameters: \[.*'top_logprobs'.*\]"
         )
         max_completion_tokens_pattern = re.compile(
@@ -443,7 +436,6 @@ class LiteLLMModel(BenchmarkModule):
         temperature_messages = [
             "'temperature' is not supported with this model.",
             "temperature is not supported with this model",
-            r"does not support parameters: \[.*'temperature'.*\]",
         ]
         temperature_must_be_one_messages = [
             "`temperature` may only be set to 1",
@@ -464,10 +456,7 @@ class LiteLLMModel(BenchmarkModule):
             "the model returned empty outputs",
         ]
 
-        if (
-            any(msg.lower() in error_msg for msg in stop_messages)
-            or stop_pattern.search(string=error_msg) is not None
-        ):
+        if any(msg.lower() in error_msg for msg in stop_messages):
             log_once(
                 f"The model {model_id!r} does not support "
                 "stop sequences, so disabling them.",
@@ -477,7 +466,7 @@ class LiteLLMModel(BenchmarkModule):
             return generation_kwargs
         elif (
             any(msg.lower() in error_msg for msg in logprobs_messages)
-            or logprobs_pattern.search(string=error_msg) is not None
+            or logprobs_pattern.search(string=error_msg)
             # Special case for Vertex AI models, since they have strict rate
             # limits on using logprobs. They also have a cap of 5 logprobs, but
             # we ignore this since the rate limiting makes it unusable anyway.
@@ -487,15 +476,10 @@ class LiteLLMModel(BenchmarkModule):
                 f"The model {model_id!r} does not support logprobs, so disabling it.",
                 level=logging.DEBUG,
             )
-            self.buffer["first_label_token_mapping"] = False
             generation_kwargs.pop("logprobs", None)
             generation_kwargs.pop("top_logprobs", None)
-            generation_kwargs.pop("response_format", None)
             return generation_kwargs
-        elif (
-            any(msg.lower() in error_msg for msg in top_logprobs_messages)
-            or top_logprobs_pattern.search(string=error_msg) is not None
-        ):
+        elif any(msg.lower() in error_msg for msg in top_logprobs_messages):
             log_once(
                 f"The model {model_id!r} does not support the `top_logprobs` argument, "
                 "so moving the value to `logprobs`.",
@@ -540,7 +524,7 @@ class LiteLLMModel(BenchmarkModule):
             )
             ner_tag_names = list(self.dataset_config.prompt_label_mapping.values())
             keys_and_their_types = {
-                tag_name: (c.Sequence[str], ...) for tag_name in ner_tag_names
+                tag_name: (list[str], ...) for tag_name in ner_tag_names
             }
             pydantic_class = create_model("AnswerFormat", **keys_and_their_types)
             generation_kwargs["response_format"] = pydantic_class
@@ -686,11 +670,9 @@ class LiteLLMModel(BenchmarkModule):
     async def _generate_async(
         self,
         model_id: str,
-        inputs: c.Sequence[c.Sequence[litellm.AllMessageValues] | str],
+        inputs: list[list[litellm.AllMessageValues] | str],
         **generation_kwargs,
-    ) -> tuple[
-        c.Sequence[tuple[int, "ModelResponse"]], c.Sequence[tuple[int, Exception]]
-    ]:
+    ) -> tuple[list[tuple[int, "ModelResponse"]], list[tuple[int, Exception]]]:
         """Generate outputs from the model asynchronously.
 
         Args:
@@ -718,7 +700,7 @@ class LiteLLMModel(BenchmarkModule):
         )
 
         # Get the LLM generations asynchronously
-        max_concurrent_calls = 20
+        max_concurrent_calls = 2
         semaphore = asyncio.Semaphore(max_concurrent_calls)
         if self.generative_type == GenerativeType.BASE:
             if not all(isinstance(input_, str) for input_ in inputs):
@@ -791,7 +773,7 @@ class LiteLLMModel(BenchmarkModule):
 
     @staticmethod
     def _create_model_output(
-        model_responses: c.Sequence["ModelResponse"], model_id: str
+        model_responses: list["ModelResponse"], model_id: str
     ) -> GenerativeModelOutput:
         """Create a GenerativeModelOutput object from a list of ModelResponse objects.
 
@@ -865,7 +847,7 @@ class LiteLLMModel(BenchmarkModule):
                     )
                     continue
 
-                logprobs_list: c.Sequence[c.Sequence[tuple[str, float]]]
+                logprobs_list: list[list[tuple[str, float]]]
                 if isinstance(logprobs_obj, ChoiceLogprobs):
                     logprobs_list = [
                         [
@@ -1161,7 +1143,7 @@ class LiteLLMModel(BenchmarkModule):
         return -1
 
     @property
-    def data_collator(self) -> c.Callable[[c.Sequence[t.Any]], dict[str, t.Any]]:
+    def data_collator(self) -> c.Callable[[list[t.Any]], dict[str, t.Any]]:
         """The data collator used to prepare samples during finetuning.
 
         Returns:
@@ -1427,7 +1409,7 @@ class LiteLLMModel(BenchmarkModule):
 
         return dataset
 
-    @cache_arguments()
+    @cache
     def get_generation_kwargs(self, dataset_config: DatasetConfig) -> dict[str, t.Any]:
         """Get the generation arguments for the model.
 
@@ -1547,7 +1529,7 @@ class LiteLLMModel(BenchmarkModule):
         # First attempt is a test run with a single conversation to handle errors
         # quickly. We repeat this multiple times to deal with different types of
         # errors, and stop if we get a successful response.
-        test_input: c.Sequence[litellm.AllMessageValues] | str
+        test_input: list[litellm.AllMessageValues] | str
         if self.generative_type == GenerativeType.BASE:
             test_input = "Test message"
         else:
@@ -1606,7 +1588,7 @@ def try_download_ollama_model(model_id: str) -> bool:
         )
 
     try:
-        downloaded_ollama_models: c.Sequence[str] = [
+        downloaded_ollama_models: list[str] = [
             model_obj.model
             for model_obj in ollama.list().models
             if model_obj.model is not None
